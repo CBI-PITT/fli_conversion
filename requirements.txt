@@ -52,6 +52,6 @@ urllib3==2.5.0
 wheel==0.45.1
 xyzservices==2025.4.0
 zarr==2.18.2
-zarr_stores==0.1.dev25+g6660f84dd
+zarr_stores==git+https://github.com/CBI-PITT/zarr_stores.git
 zict==3.0.0
 zstandard==0.25.0
