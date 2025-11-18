@@ -771,6 +771,7 @@ def parallel_convert(files, out_dir, voxel=(1,1,1), xy_levels=0,
 if __name__ == "__main__":
     # # Example: glob your FLI set
     import glob,argparse
+    from pathlib import Path
 
  
     parser = argparse.ArgumentParser(
@@ -779,8 +780,14 @@ if __name__ == "__main__":
 
     parser.add_argument("--dir", type=str, default=None,
                         help="Directory containing .fli files to convert.")
-    parser.add_argument("--file", type=str, default=None,
-                        help="Single .fli file to convert.")
+    parser.add_argument(
+        "--file",
+        type=str,
+        nargs="+",          # <-- key change: one or more values
+        default=None,
+        help="One or more .fli files to convert."
+    )
+
     parser.add_argument("--voxel", type=float, nargs=3, required=True,
                         metavar=('Z', 'Y', 'X'),
                         help="Voxel size in microns, e.g. --voxel 2 1.17 1.04")
@@ -793,18 +800,21 @@ if __name__ == "__main__":
     files_list = []
     # Collect single file (if provided)
     if args.file:
-        if os.path.isfile(args.file):
-            print(f"Adding single file for conversion: {args.file}")
-            files_list.append(args.file)  # <-- FIX: don't assign the return value
-        else:
-            print(f"Error: The specified file '{args.file}' does not exist.")
+            for f in args.file:
+                if os.path.isfile(f):
+                    if f.endswith('.fli') or f.endswith('.zst'):
+                        files_list.append(f)
+                else:
+                    print(f"Error: The specified file '{f}' does not exist.")
     if args.dir:
         if os.path.isdir(args.dir):
-            files_raw = glob.glob(os.path.join(args.dir, "*.fli"))
-            # If your compressed files are .fli.zst, prefer "*.fli.zst" (see note below)
-            files_compressed = glob.glob(os.path.join(args.dir, "*.zst"))
-            files_list.extend(files_raw)
-            files_list.extend(files_compressed)
+            # files_raw = glob.glob(os.path.join(args.dir, "*.fli"))
+            # files_compressed = glob.glob(os.path.join(args.dir, "*.zst"))
+            files_raw = list(Path(args.dir).rglob("*.fli"))
+            files_compressed = list(Path(args.dir).rglob("*.zst"))
+
+            files_list.extend([str(p) for p in files_raw])
+            files_list.extend([str(p) for p in files_compressed])
         else:
             print(f"Error: The specified directory '{args.dir}' does not exist.")
 
