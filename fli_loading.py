@@ -1,4 +1,5 @@
 import os
+from sys import exception
 import time
 import zstandard as zstd
 import numpy as np
@@ -305,9 +306,9 @@ def fli_loading(
         hicam_file, header_info=None, frames_at_once=frames_at_once
     ):
         # print(loc)
-        if loc['frames'] != frames_at_once:
+        if loc['frames'] != frames_at_once and loc['frames'] == Z % frames_at_once + 1:
             if loc['frames'] != 1:
-                print(f"Incomplete frame group at the end: {loc}")
+                print(f"Adjusting frame group at the end: {loc}")
                 adjust_value = (1 * Y * X * 12)//8
                 loc['frames'] = loc['frames'] - 1
                 loc['len'] = loc['len'] - adjust_value
@@ -318,6 +319,8 @@ def fli_loading(
                 break
             else:
                 break
+        else:
+            raise exception("Unhandled frame groups.")
         locs.append(loc)
         # if len(locs) == full_groups:
         #     break
