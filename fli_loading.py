@@ -306,22 +306,22 @@ def fli_loading(
         hicam_file, header_info=None, frames_at_once=frames_at_once
     ):
         # print(loc)
-        if loc['frames'] != frames_at_once and loc['frames'] == Z % frames_at_once + 1:
-            if loc['frames'] != 1:
-                print(f"Adjusting frame group at the end: {loc}")
-                adjust_value = (1 * Y * X * 12)//8
-                loc['frames'] = loc['frames'] - 1
-                loc['len'] = loc['len'] - adjust_value
-                loc['stop'] = loc['stop'] - adjust_value
-
-                print(f"Adjusted to read {loc['frames']} frames for last full group: {loc}")
-                locs.append(loc)
-                break
+        if loc['frames'] != frames_at_once:
+            if loc['frames'] == Z % frames_at_once + 1:
+                if loc['frames'] != 1:
+                    print(f"Adjusting frame group at the end: {loc}")
+                    adjust_value = (1 * Y * X * 12)//8
+                    loc['frames'] = loc['frames'] - 1
+                    loc['len'] = loc['len'] - adjust_value
+                    loc['stop'] = loc['stop'] - adjust_value
+                    print(f"Adjusted to read {loc['frames']} frames for last full group: {loc}")
+                    locs.append(loc)
+                else:
+                    print(f"Skipping last incomplete frame group: {loc}")
             else:
-                break
+                raise Exception("Unhandled frame groups.")
         else:
-            raise Exception("Unhandled frame groups.")
-        locs.append(loc)
+            locs.append(loc)
         # if len(locs) == full_groups:
         #     break
 
