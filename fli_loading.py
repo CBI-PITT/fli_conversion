@@ -320,7 +320,7 @@ def fli_loading(
             else:
                 break
         else:
-            raise exception("Unhandled frame groups.")
+            raise Exception("Unhandled frame groups.")
         locs.append(loc)
         # if len(locs) == full_groups:
         #     break
