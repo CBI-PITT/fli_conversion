@@ -1,3 +1,6 @@
+# Zarr v2 environment spec: required for the ome_version 0.4 output path
+# (H5-backed .omehans stores via zarr_stores). For the ome_version 0.5 output
+# (sharded zarr v3, .ome.zarr), see requirements-zarr3.txt instead.
 asciitree==0.3.3
 bokeh==3.8.0
 Bottleneck==1.4.2

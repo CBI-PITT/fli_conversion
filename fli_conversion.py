@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from typing import Tuple
 from enum import Enum
 import os, concurrent.futures
-from zarr_stores.h5_nested_store import H5_Nested_Store
 from numcodecs import Blosc
 from fli_loading import fli_loading
 import time
@@ -199,38 +198,6 @@ class ChunkScheme:
         return (min(zc, z_l), min(yc, y_l), min(xc, x_l))
 
 
-import math
-from typing import Tuple, Optional
-
-def _validate_divisible(chunks: Tuple[int,int,int], shards: Tuple[int,int,int]) -> bool:
-    return all(c % s == 0 for c, s in zip(chunks, shards))
-
-def _coerce_shards(chunks: Tuple[int,int,int],
-                   desired: Tuple[int,int,int]) -> Tuple[int,int,int]:
-    """
-    Guaranteed-valid shards for Zarr v3: choose a divisor of each chunk dim,
-    <= desired, never 0.
-    """
-    out = []
-    for d, c in zip(desired, chunks):
-        d = int(d); c = int(c)
-        # clamp to chunk dim first
-        s = min(max(1, d), c)
-        # step down by gcd until it divides
-        g = math.gcd(s, c)
-        if g == 0:   # extremely defensive; shouldn't happen
-            g = 1
-        # If gcd(s, c) < s, try gcd(down, c) until it divides
-        while c % g != 0 and g > 1:
-            s = max(1, g)
-            g = math.gcd(s, c)
-        if c % g != 0:
-            # worst-case fallback: 1
-            g = 1
-        out.append(g)
-    return tuple(out)
-
-
 def init_h5_nested_store_v2(
     spec: PyramidSpec,
     path=STORE_PATH,
@@ -246,6 +213,16 @@ def init_h5_nested_store_v2(
     Creates one 5D dataset per level named s{l} with shape (1,1,z,y,x).
     """
     # Open H5-backed store and zarr v2 group (overwrite)
+    # Imported lazily: zarr_stores requires zarr v2 (zarr._storage was removed
+    # in zarr 3); it is only needed for the ome_version 0.4 path.
+    try:
+        from zarr_stores.h5_nested_store import H5_Nested_Store
+    except ImportError as e:
+        raise ImportError(
+            "ome_version 0.4 requires the 'zarr_stores' package with zarr v2 "
+            "(zarr<3) and h5py installed. Under zarr v3 the H5-backed store is "
+            "unavailable; use ome_version 0.5 (sharded zarr v3) instead."
+        ) from e
     store = H5_Nested_Store(path)
     root = zarr.open_group(store=store, mode="w")
     arrs = []
@@ -304,6 +281,110 @@ def init_h5_nested_store_v2(
     return root, arrs
 
 
+def init_sharded_zarr_v3(
+    spec: PyramidSpec,
+    path=STORE_PATH,
+    chunk_scheme: ChunkScheme = ChunkScheme(),
+    compressor=None,  # zarr v3 codec (e.g. zarr.codecs.BloscCodec); None -> default
+    voxel_size=(1.0, 1.0, 1.0),
+    unit="micrometer",
+    xy_levels: int = 0,
+    shard_shape: Tuple[int, int, int] | None = None,
+):
+    """
+    Initialize a multiscale pyramid as a sharded zarr v3 store (OME-NGFF 0.5).
+    Creates one 5D sharded array per level named s{l} with shape (1,1,z,y,x).
+    """
+    try:
+        from zarr.codecs import BloscCodec
+    except ImportError as e:
+        raise ImportError(
+            "ome_version 0.5 requires zarr v3 (zarr>=3.1). Install zarr v3, or "
+            "use ome_version 0.4 in a zarr v2 environment."
+        ) from e
+
+    if compressor is None:
+        compressor = BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")
+
+    # Plan every level (and validate shard shapes) before creating anything,
+    # so an invalid shard shape does not leave a partial store behind.
+    level_plans = []
+    for l in range(spec.levels):
+        zf, yf, xf = level_factors(l, xy_levels)
+        z_l = ceil_div(spec.z_size_estimate, zf)
+        y_l = ceil_div(spec.y, yf)
+        x_l = ceil_div(spec.x, xf)
+        lvl_shape_zyx = (z_l, y_l, x_l)
+        print(f"Level {l} shape (z,y,x): {lvl_shape_zyx}")
+
+        zc, yc, xc = chunk_scheme.chunks_for_level(l, lvl_shape_zyx)
+
+        if shard_shape is None:
+            # Default matches stack_to_multiscale_ngff_test (zarr3 branch):
+            # 4x the chunk along z, chunk-sized along y/x, 1 along t/c.
+            desired_zyx = (4 * zc, yc, xc)
+        else:
+            desired_zyx = tuple(int(s) for s in shard_shape)
+        for s, c, axis_name in zip(desired_zyx, (zc, yc, xc), "zyx"):
+            if s < c or s % c != 0:
+                raise ValueError(
+                    f"Invalid shard shape {desired_zyx}: axis '{axis_name}' value "
+                    f"{s} must be a multiple of the chunk value {c}."
+                )
+        # Clip the shard to the level extent (edge shard may be partial),
+        # matching _storage_shapes in stack_to_multiscale_ngff_test.
+        sz, sy, sx = (
+            c * min(s // c, ceil_div(n, c))
+            for s, c, n in zip(desired_zyx, (zc, yc, xc), lvl_shape_zyx)
+        )
+        print(f"Level {l} chunks (z,y,x): {(zc, yc, xc)}, shards (z,y,x): {(sz, sy, sx)}")
+        level_plans.append((f"s{l}", (1, 1, z_l, y_l, x_l), (1, 1, zc, yc, xc), (1, 1, sz, sy, sx)))
+
+    root = zarr.open_group(path, mode="w", zarr_format=3)
+    arrs = []
+    for name, shape_5d, chunks_5d, shards_5d in level_plans:
+        a = root.create_array(
+            name,
+            shape=shape_5d,
+            chunks=chunks_5d,
+            shards=shards_5d,
+            dtype="uint16",
+            compressors=[compressor],
+            dimension_names=("t", "c", "z", "y", "x"),
+        )
+        arrs.append(a)
+
+    # OME-NGFF 0.5 metadata, nested under the "ome" key at the group root
+    dz, dy, dx = voxel_size
+    datasets = []
+    for l in range(spec.levels):
+        zf, yf, xf = level_factors(l, xy_levels)
+        s = [1.0, 1.0, dz * zf, dy * yf, dx * xf]
+        datasets.append({
+            "path": f"s{l}",
+            "coordinateTransformations": [{"type": "scale", "scale": s}],
+        })
+
+    axes = [
+        {"name": "t", "type": "time", "unit": "millisecond"},
+        {"name": "c", "type": "channel"},
+        {"name": "z", "type": "space", "unit": "micrometer"},
+        {"name": "y", "type": "space", "unit": "micrometer"},
+        {"name": "x", "type": "space", "unit": "micrometer"},
+    ]
+
+    root.attrs["ome"] = {
+        "version": "0.5",
+        "multiscales": [{
+            "axes": axes,
+            "datasets": datasets,
+            "name": "image",
+            "type": "image",
+        }],
+    }
+    return root, arrs
+
+
 class FlushPad(Enum):
     DUPLICATE_LAST = "duplicate_last"  # repeat last plane to fill the chunk
     ZEROS = "zeros"                    # pad with zeros
@@ -324,8 +405,14 @@ class Live3DPyramidWriter:
                  max_inflight_chunks: int | None = None,
                  async_close: bool = True,
                  shard_shape: Tuple[int, int, int] | None = None,
-                 xy_levels: int | None = None):
+                 xy_levels: int | None = None,
+                 ome_version: str = "0.5"):
 
+        ome_version = str(ome_version)
+        if ome_version not in ("0.4", "0.5"):
+            raise ValueError(f"Unsupported ome_version {ome_version!r}; use '0.4' or '0.5'.")
+        self.ome_version = ome_version
+        self.out_path = path
         self.spec = spec
         self.chunk_scheme = chunk_scheme
         self.flush_pad = flush_pad
@@ -336,11 +423,15 @@ class Live3DPyramidWriter:
         self.finalize_future = None
 
 
-        self.root, self.arrs = init_h5_nested_store_v2(
-            spec, path, chunk_scheme=chunk_scheme, compressor=compressor,
+        init_kwargs = dict(
+            spec=spec, path=path, chunk_scheme=chunk_scheme, compressor=compressor,
             voxel_size=voxel_size, xy_levels=self.xy_levels,
-            shard_shape=shard_shape,  # ignored in v2
+            shard_shape=shard_shape,
         )
+        if ome_version == "0.5":
+            self.root, self.arrs = init_sharded_zarr_v3(**init_kwargs)
+        else:
+            self.root, self.arrs = init_h5_nested_store_v2(**init_kwargs)
 
 
 
@@ -360,6 +451,13 @@ class Live3DPyramidWriter:
             zc, yc, xc = self.chunk_scheme.chunks_for_level(l, (z_l, y_l, x_l))
             self.zc.append(zc)
             self.yx_shapes.append((y_l, x_l))
+
+        # Flush unit: a whole zarr v3 shard (no read-modify-write on full-shard
+        # writes); falls back to the chunk size for zarr v2 arrays.
+        self.flush_z = []
+        for l in range(self.levels):
+            sh = getattr(self.arrs[l], "shards", None)
+            self.flush_z.append(int(sh[2]) if sh is not None else self.zc[l])
 
         # Concurrency primitives
         self.q = queue.Queue(maxsize=ingest_queue_size)
@@ -455,6 +553,9 @@ class Live3DPyramidWriter:
         try:
             import pathlib
             store_path = getattr(self.root.store, "path", None)
+            if store_path is None:
+                # zarr v3 LocalStore exposes its base path as .root
+                store_path = getattr(self.root.store, "root", None)
             if store_path:
                 pathlib.Path(store_path, ".READY").write_text("ok")
         except Exception:
@@ -520,33 +621,34 @@ class Live3DPyramidWriter:
     def _ensure_active_buffer(self, level: int, start_z: int):
         """Allocate active chunk buffer for a level if absent, starting at start_z."""
         if self.buffers[level] is None:
-            zc = self.zc[level]
+            flush_z = self.flush_z[level]
             y_l, x_l = self.yx_shapes[level]
-            self.buffers[level] = np.empty((zc, y_l, x_l), dtype=np.uint16)
+            self.buffers[level] = np.empty((flush_z, y_l, x_l), dtype=np.uint16)
             self.buf_fill[level] = 0
             self.buf_start[level] = start_z
 
     def _append_to_active_buffer(self, level: int, z_index: int, plane: np.ndarray):
         """Append plane into the active buffer; flush when full."""
-        zc = self.zc[level]
+        flush_z = self.flush_z[level]
         if self.buf_fill[level] == 0:
-            # Align start to chunk boundary; with strictly increasing z, z_index should already align when new chunk begins
-            start_z = (z_index // zc) * zc
+            # Align start to shard (v3) / chunk (v2) boundary; with strictly
+            # increasing z, z_index should already align when a new block begins
+            start_z = (z_index // flush_z) * flush_z
             self._ensure_active_buffer(level, start_z)
 
         offset = z_index - self.buf_start[level]
         self.buffers[level][offset, :, :] = plane
         self.buf_fill[level] += 1
 
-        if self.buf_fill[level] == zc:
-            # Full chunk -> flush and reset
+        if self.buf_fill[level] == flush_z:
+            # Full shard (v3) / chunk (v2) -> flush and reset
             buf = self.buffers[level]
             z0 = self.buf_start[level]
             # hand a copy to the pool to avoid mutation races
             self._submit_write_chunk(level, z0, buf)
             self.buffers[level] = None
             self.buf_fill[level] = 0
-            self.buf_start[level] = z0 + zc
+            self.buf_start[level] = z0 + flush_z
 
     # def _pad_and_flush_partial_chunk(self, level: int):
     #     """Pad the active buffer to full chunk size (duplicate last or zeros) and flush."""
@@ -639,7 +741,8 @@ class Live3DPyramidWriter:
         self._emit_next(level + 1, ds2_mean_uint16(out_3d))
 
 
-def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0):
+def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0,
+                ome_version="0.5", shard_shape=None):
     # Keep Blosc from oversubscribing inside each process
     # os.environ.setdefault("BLOSC_NTHREADS", "4")   # tune if needed
     pid = os.getpid()
@@ -658,20 +761,27 @@ def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0):
     # Build output path
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / (Path(file_path).stem + ".omehans")
+    ome_version = str(ome_version)
+    ext = ".ome.zarr" if ome_version == "0.5" else ".omehans"
+    out_path = out_dir / (Path(file_path).stem + ext)
 
     # Writer: keep internal workers modest (we’re already in a process)
+    n_workers = max(1, os.cpu_count() // 4)
     with Live3DPyramidWriter(
         spec,
         voxel_size=voxel,
         path=str(out_path),
-        max_workers=max(1, os.cpu_count() // 4),   # tune: small threadpool per proc
+        max_workers=n_workers,   # tune: small threadpool per proc
         chunk_scheme=scheme,
-        compressor=Blosc(cname="zstd", clevel=5, shuffle=True),
-        shard_shape=None,
+        compressor=Blosc(cname="zstd", clevel=5, shuffle=True) if ome_version == "0.4" else None,
+        shard_shape=shard_shape,
         flush_pad=FlushPad.DUPLICATE_LAST,
         async_close=False,
         xy_levels=xy_levels,
+        ome_version=ome_version,
+        # v3 shard buffers are 4x a v2 chunk buffer: cap in-flight writes at one
+        # per pool thread to bound peak RAM.
+        max_inflight_chunks=n_workers if ome_version == "0.5" else None,
     ) as writer:
         # Stream frames into the writer
         for k in range(Z_EST):
@@ -679,7 +789,8 @@ def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0):
     print(f"[PID {pid}] done with {file_path}")
     return str(out_path)
 
-def worker_loop(task_q, success_q,error_q, out_dir, voxel, xy_levels):
+def worker_loop(task_q, success_q,error_q, out_dir, voxel, xy_levels,
+                ome_version="0.5", shard_shape=None):
     """Each process pulls tasks from the queue until it's empty."""
     while True:
         file_path = task_q.get()
@@ -687,7 +798,8 @@ def worker_loop(task_q, success_q,error_q, out_dir, voxel, xy_levels):
             task_q.task_done() 
             break
         try:
-            res = convert_one(file_path, out_dir, voxel, xy_levels)
+            res = convert_one(file_path, out_dir, voxel, xy_levels,
+                              ome_version=ome_version, shard_shape=shard_shape)
             success_q.put(res)
         except Exception as e:
             error_q.put((file_path, f"error: {e}"))
@@ -696,7 +808,7 @@ def worker_loop(task_q, success_q,error_q, out_dir, voxel, xy_levels):
 
 
 def parallel_convert(files, out_dir, voxel=(1,1,1), xy_levels=0,
-                     max_queue=10, num_workers=5):
+                     max_queue=10, num_workers=5, ome_version="0.5", shard_shape=None):
     """
     Run conversion on many files with bounded memory use.
 
@@ -709,7 +821,8 @@ def parallel_convert(files, out_dir, voxel=(1,1,1), xy_levels=0,
     # Start workers
     workers = [
         mp.Process(target=worker_loop,
-                   args=(task_q, success_q, error_q, out_dir, voxel, xy_levels))
+                   args=(task_q, success_q, error_q, out_dir, voxel, xy_levels,
+                         ome_version, shard_shape))
         for _ in range(num_workers)
     ]
     for w in workers:
@@ -795,6 +908,18 @@ if __name__ == "__main__":
                         help="Output directory or file path.")
     parser.add_argument("--num_workers", type=int, default=1,
                         help="Number of concurrent worker processes for batch conversion.")
+    parser.add_argument("--ome_version", type=str, default="0.5", choices=["0.4", "0.5"],
+                        help="Output OME-Zarr version. 0.5 (default): sharded zarr v3, "
+                             "written as <stem>.ome.zarr (requires a zarr v3 environment). "
+                             "0.4: legacy H5-backed zarr v2, written as <stem>.omehans "
+                             "(requires a zarr v2 environment with zarr_stores).")
+    parser.add_argument("--shard_shape", type=int, nargs=3, default=None,
+                        metavar=('Z', 'Y', 'X'),
+                        help="Shard shape (z,y,x) for the 0.5 sharded output. Default: "
+                             "4x the chunk along z, chunk-sized along y/x. Each value must "
+                             "be a multiple of that axis' chunk size (256 with the default "
+                             "chunking); smaller z values reduce peak RAM, e.g. "
+                             "--shard_shape 256 256 256.")
 
     args = parser.parse_args()
     files_list = []
@@ -826,7 +951,9 @@ if __name__ == "__main__":
         print(f"Starting batch conversion of {len(files_list)} files...")
         start_time = time.time()
         sucess, error = parallel_convert(files_list, out_path, voxel=voxel_size, xy_levels=0,
-                                   max_queue=10, num_workers=num_workers)
+                                   max_queue=10, num_workers=num_workers,
+                                   ome_version=args.ome_version,
+                                   shard_shape=args.shard_shape)
         print(f"Successfully converted {len(sucess)} out of {len(files_list)} files.")
         print(f"Errors encountered for {len(error)} files: {error}")
         end_time = time.time()

@@ -1,0 +1,10 @@
+# Environment spec for the ome_version 0.5 output path (sharded zarr v3,
+# written as <stem>.ome.zarr). The ome_version 0.4 path (H5-backed .omehans
+# stores) requires the requirements.txt environment instead: zarr v2 (needed
+# by zarr_stores) and zarr v3 cannot coexist in one environment.
+dask
+numcodecs>=0.16,<1
+numpy>=2
+tifffile
+zarr>=3.1,<4
+zstandard

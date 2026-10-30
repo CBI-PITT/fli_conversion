@@ -1,5 +1,12 @@
 #!/bin/bash
 
+# ome.zarr version selection (default 0.5 = sharded zarr v3, .ome.zarr;
+# 0.4 = legacy H5-backed .omehans, needs a zarr v2 env with zarr_stores)
+#python fli_conversion.py --dir <dir> --voxel 2 1.3 0.75 --output <out> --ome_version 0.5
+#python fli_conversion.py --dir <dir> --voxel 2 1.3 0.75 --output <out> --ome_version 0.4
+# optional shard shape (z y x; multiples of the 256-chunk; smaller z = less RAM)
+#python fli_conversion.py --dir <dir> --voxel 2 1.3 0.75 --output <out> --shard_shape 256 256 256
+
 # only dir with uncompressed .fli files
 #python fli_conversion.py --dir /bil/proj/rf1hillman/2025_09_04_HOLiS_NPBB328_Cortex_Slab7_test_tissueXYZ --voxel 2 1.3 0.75 --output /bil/proj/rf1hillman/fli_conversion/small_uncompressed --num_workers 20
 #python fli_conversion.py --dir /bil/proj/rf1hillman/fli_conversion/more_test/uncompressed_input \
