@@ -741,8 +741,31 @@ class Live3DPyramidWriter:
         self._emit_next(level + 1, ds2_mean_uint16(out_3d))
 
 
+def resolve_writer_backend(writer_arg, ome_version):
+    """Map a CLI --writer value + ome_version to a backend (None: 0.5->acquire, 0.4->python)."""
+    if writer_arg is None:
+        return "acquire" if ome_version == "0.5" else "python"
+    if writer_arg not in ("acquire", "python"):
+        raise ValueError(
+            f"Unknown writer backend {writer_arg!r}; use 'acquire' or 'python'."
+        )
+    if writer_arg == "acquire" and ome_version != "0.5":
+        raise ValueError("acquire-zarr backend requires ome_version 0.5")
+    return writer_arg
+
+
 def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0,
-                ome_version="0.5", shard_shape=None):
+                ome_version="0.5", shard_shape=None, writer_backend="acquire"):
+    # Guards must fire before fli_loading: no file I/O on invalid input.
+    if writer_backend not in ("acquire", "python"):
+        raise ValueError(
+            f"Unknown writer backend {writer_backend!r}; use 'acquire' or 'python'."
+        )
+    if ome_version == "0.4" and writer_backend == "acquire":
+        raise ValueError("acquire-zarr backend requires ome_version 0.5")
+    if writer_backend == "acquire" and int(xy_levels) != 0:
+        raise ValueError("acquire-zarr decimates all spatial axes; xy_levels must be 0")
+
     # Keep Blosc from oversubscribing inside each process
     # os.environ.setdefault("BLOSC_NTHREADS", "4")   # tune if needed
     pid = os.getpid()
@@ -764,6 +787,26 @@ def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0,
     ome_version = str(ome_version)
     ext = ".ome.zarr" if ome_version == "0.5" else ".omehans"
     out_path = out_dir / (Path(file_path).stem + ext)
+
+    if writer_backend == "acquire":
+        # Lazy import: the python backend must not require acquire-zarr.
+        from acquire_zarr_writer import write_volume_ome_zarr_acquire
+
+        # acquire's max_levels caps ADDITIONAL pyramid levels (total datasets
+        # = max_levels + 1, T1 ground truth), while plan_levels counts TOTAL
+        # levels (s0..s{levels-1}): levels - 1 reproduces the python writer's
+        # pyramid depth exactly.
+        write_volume_ome_zarr_acquire(
+            image,
+            out_path,
+            voxel_size_zyx_um=tuple(float(v) for v in voxel),
+            chunk_shape_zyx=(256, 256, 256),
+            shard_shape_zyx=(tuple(int(s) for s in shard_shape) if shard_shape else None),
+            num_levels=max(0, levels - 1),
+            overwrite=False,
+        )
+        print(f"[PID {pid}] done with {file_path}")
+        return str(out_path)
 
     # Writer: keep internal workers modest (we’re already in a process)
     n_workers = max(1, os.cpu_count() // 4)
@@ -790,7 +833,7 @@ def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0,
     return str(out_path)
 
 def worker_loop(task_q, success_q,error_q, out_dir, voxel, xy_levels,
-                ome_version="0.5", shard_shape=None):
+                ome_version="0.5", shard_shape=None, writer_backend="acquire"):
     """Each process pulls tasks from the queue until it's empty."""
     while True:
         file_path = task_q.get()
@@ -799,7 +842,8 @@ def worker_loop(task_q, success_q,error_q, out_dir, voxel, xy_levels,
             break
         try:
             res = convert_one(file_path, out_dir, voxel, xy_levels,
-                              ome_version=ome_version, shard_shape=shard_shape)
+                              ome_version=ome_version, shard_shape=shard_shape,
+                              writer_backend=writer_backend)
             success_q.put(res)
         except Exception as e:
             error_q.put((file_path, f"error: {e}"))
@@ -808,7 +852,8 @@ def worker_loop(task_q, success_q,error_q, out_dir, voxel, xy_levels,
 
 
 def parallel_convert(files, out_dir, voxel=(1,1,1), xy_levels=0,
-                     max_queue=10, num_workers=5, ome_version="0.5", shard_shape=None):
+                     max_queue=10, num_workers=5, ome_version="0.5", shard_shape=None,
+                     writer_backend="acquire"):
     """
     Run conversion on many files with bounded memory use.
 
@@ -822,7 +867,7 @@ def parallel_convert(files, out_dir, voxel=(1,1,1), xy_levels=0,
     workers = [
         mp.Process(target=worker_loop,
                    args=(task_q, success_q, error_q, out_dir, voxel, xy_levels,
-                         ome_version, shard_shape))
+                         ome_version, shard_shape, writer_backend))
         for _ in range(num_workers)
     ]
     for w in workers:
@@ -910,18 +955,29 @@ if __name__ == "__main__":
                         help="Number of concurrent worker processes for batch conversion.")
     parser.add_argument("--ome_version", type=str, default="0.5", choices=["0.4", "0.5"],
                         help="Output OME-Zarr version. 0.5 (default): sharded zarr v3, "
-                             "written as <stem>.ome.zarr (requires a zarr v3 environment). "
+                             "written as <stem>.ome.zarr (requires a zarr v3 environment), "
+                             "written with the acquire-zarr C++ writer by default "
+                             "(--writer python for the previous writer). "
                              "0.4: legacy H5-backed zarr v2, written as <stem>.omehans "
                              "(requires a zarr v2 environment with zarr_stores).")
+    parser.add_argument("--writer", type=str, choices=["acquire", "python"], default=None,
+                        help="Writer backend for ome_version 0.5. Default: acquire "
+                             "(acquire-zarr C++). 'python' uses the Live3DPyramidWriter. "
+                             "ome_version 0.4 always uses python.")
     parser.add_argument("--shard_shape", type=int, nargs=3, default=None,
                         metavar=('Z', 'Y', 'X'),
-                        help="Shard shape (z,y,x) for the 0.5 sharded output. Default: "
-                             "4x the chunk along z, chunk-sized along y/x. Each value must "
-                             "be a multiple of that axis' chunk size (256 with the default "
-                             "chunking); smaller z values reduce peak RAM, e.g. "
-                             "--shard_shape 256 256 256.")
+                        help="Shard shape (z,y,x) for the 0.5 sharded output, honored by "
+                             "both writer backends (acquire is the default for 0.5). "
+                             "Default: 4x the chunk along z, chunk-sized along y/x. Each "
+                             "value must be a multiple of that axis' chunk size (256 with "
+                             "the default chunking); smaller z values reduce peak RAM, "
+                             "e.g. --shard_shape 256 256 256.")
 
     args = parser.parse_args()
+    try:
+        writer_backend = resolve_writer_backend(args.writer, args.ome_version)
+    except ValueError as e:
+        parser.error(str(e))
     files_list = []
     # Collect single file (if provided)
     if args.file:
@@ -953,7 +1009,8 @@ if __name__ == "__main__":
         sucess, error = parallel_convert(files_list, out_path, voxel=voxel_size, xy_levels=0,
                                    max_queue=10, num_workers=num_workers,
                                    ome_version=args.ome_version,
-                                   shard_shape=args.shard_shape)
+                                   shard_shape=args.shard_shape,
+                                   writer_backend=writer_backend)
         print(f"Successfully converted {len(sucess)} out of {len(files_list)} files.")
         print(f"Errors encountered for {len(error)} files: {error}")
         end_time = time.time()
