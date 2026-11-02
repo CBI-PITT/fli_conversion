@@ -6,6 +6,11 @@
 #python fli_conversion.py --dir <dir> --voxel 2 1.3 0.75 --output <out> --ome_version 0.4
 # optional shard shape (z y x; multiples of the 256-chunk; smaller z = less RAM)
 #python fli_conversion.py --dir <dir> --voxel 2 1.3 0.75 --output <out> --shard_shape 256 256 256
+# writer backend (default acquire for 0.5 = acquire-zarr C++; 'python' = previous writer)
+#python fli_conversion.py --dir <dir> --voxel 2 1.3 0.75 --output <out> --writer python
+# note: --ome_version 0.4 always uses the python writer (acquire-zarr is 0.5-only)
+# note: re-running over an existing .ome.zarr raises FileExistsError with the acquire backend (the python backend overwrote silently) - remove the old store first
+# note: with --num_workers > 1 each worker's acquire-zarr writer uses all visible CPUs - reduce --num_workers on CPU-bound SLURM jobs
 
 # only dir with uncompressed .fli files
 #python fli_conversion.py --dir /bil/proj/rf1hillman/2025_09_04_HOLiS_NPBB328_Cortex_Slab7_test_tissueXYZ --voxel 2 1.3 0.75 --output /bil/proj/rf1hillman/fli_conversion/small_uncompressed --num_workers 20

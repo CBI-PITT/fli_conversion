@@ -8,3 +8,5 @@ numpy>=2
 tifffile
 zarr>=3.1,<4
 zstandard
+# acquire-zarr 0.10.x is required by the acquire writer backend (writer_backend="acquire"); 0.9 and 0.11+ have breaking API changes (DownsamplingMethod values shifted; is_ngff added in 0.10).
+acquire-zarr>=0.10,<0.11
