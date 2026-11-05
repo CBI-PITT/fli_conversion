@@ -44,6 +44,26 @@ Semantics and differences vs the repo's Live3DPyramidWriter:
 No Python-side downsampling and no full-volume copies: for a C-contiguous
 array, ``volume[z0:z1]`` is a view into the existing buffer and at most
 one slab is made contiguous per append.
+
+Performance notes (measured, 8 GiB random uint16, see
+.omo/evidence/benchmark-tuning.md):
+
+- /h20 is BeeGFS, reached either through an NFS v3 client (pollux) or the
+  native beegfs-client (production nodes, e.g. deneb02). Via the NFS client
+  this C++ writer is 2-2.5x slower than the repo's Live3DPyramidWriter:
+  acquire pwrite's each compressed chunk separately and fsyncs every shard at
+  seal, while zarr-python buffers whole shards through the page cache, and
+  that client's buffered path is ~100x faster than its O_DIRECT path. Tunables
+  (max_threads, ZARR_DIRECT_IO, slab/shard size) recover only ~25-30% there;
+  prefer the python backend from NFS clients of /h20.
+- On native BeeGFS clients (production nodes) both backends are equal within
+  noise (mount-limited); either is fine.
+- ``num_threads`` defaults to all visible CPUs; ``parallel_convert`` splits
+  them evenly across batch workers (CLI ``--writer_threads`` overrides).
+- ``ZARR_DIRECT_IO=1`` (env var, read once at the first file open) enables
+  O_DIRECT: probe the mount first (bench_beegfs_runner.py --probe) — pollux's
+  O_DIRECT path is ~100x slower than buffered, deneb02's is symmetric, and it
+  fails loudly on ext4 with EINVAL (no buffered fallback).
 """
 
 from __future__ import annotations
@@ -186,6 +206,10 @@ def write_volume_ome_zarr_acquire(
         ADDITIONAL pyramid levels; 0 means "no limit" - every level the
         natural cascade produces, exactly one dataset when the array
         fits inside one chunk on every axis (see module docstring).
+    num_threads:
+        C++ stream threads. None (default) uses all visible CPUs
+        (SLURM_CPUS_PER_TASK if set); ``parallel_convert`` passes an
+        explicit per-worker split so batch workers do not oversubscribe.
     target_slab_mib:
         Target size of each input view passed to ``stream.append``. One
         full XY plane is the smallest possible input slab.

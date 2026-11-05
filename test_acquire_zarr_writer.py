@@ -356,10 +356,45 @@ def test_physical_scale_fallback():
 def test_wiring_signatures():
     """convert_one/parallel_convert default to writer_backend='acquire'; the python writer gains no param."""
     import inspect
-    from fli_conversion import Live3DPyramidWriter, convert_one, parallel_convert
+    from fli_conversion import (
+        Live3DPyramidWriter,
+        convert_one,
+        default_writer_threads,
+        parallel_convert,
+        worker_loop,
+    )
     assert inspect.signature(convert_one).parameters["writer_backend"].default == "acquire"
     assert inspect.signature(parallel_convert).parameters["writer_backend"].default == "acquire"
     assert "writer_backend" not in inspect.signature(Live3DPyramidWriter.__init__).parameters
+
+    # num_threads plumbed through the batch path to write_volume_ome_zarr_acquire
+    for fn in (convert_one, parallel_convert, worker_loop):
+        params = inspect.signature(fn).parameters
+        assert "num_threads" in params, fn
+        assert params["num_threads"].default is None, fn
+    from acquire_zarr_writer import write_volume_ome_zarr_acquire
+    wt = inspect.signature(write_volume_ome_zarr_acquire).parameters["num_threads"]
+    assert wt.default is None
+
+    # CLI: --writer_threads flag exists and is passed through
+    import fli_conversion
+    source = inspect.getsource(fli_conversion)
+    assert '"--writer_threads"' in source
+    assert "num_threads=args.writer_threads" in source
+
+
+def test_default_writer_threads():
+    """default_writer_threads splits the visible CPUs across workers, floored at 1."""
+    from fli_conversion import default_writer_threads
+    import os
+    if hasattr(os, "sched_getaffinity"):
+        total = len(os.sched_getaffinity(0))
+    else:
+        total = os.cpu_count() or 1
+    assert default_writer_threads(4) == max(1, total // 4)
+    assert default_writer_threads(1) == max(1, total)
+    assert default_writer_threads(0) == total  # no split (degenerate worker count)
+    assert default_writer_threads(10**9) == 1  # floor: never zero threads
 
 
 def test_convert_one_guards():
@@ -437,6 +472,7 @@ def main():
         check("store_format", test_store_format)
         check("physical_scale_fallback", test_physical_scale_fallback)
         check("wiring_signatures", test_wiring_signatures)
+        check("default_writer_threads", test_default_writer_threads)
         check("convert_one_guards", test_convert_one_guards)
         check("resolve_writer_backend", test_resolve_writer_backend)
         check("single_level_zero_max_levels", test_single_level_zero_max_levels)

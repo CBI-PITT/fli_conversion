@@ -755,7 +755,8 @@ def resolve_writer_backend(writer_arg, ome_version):
 
 
 def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0,
-                ome_version="0.5", shard_shape=None, writer_backend="acquire"):
+                ome_version="0.5", shard_shape=None, writer_backend="acquire",
+                num_threads=None):
     # Guards must fire before fli_loading: no file I/O on invalid input.
     if writer_backend not in ("acquire", "python"):
         raise ValueError(
@@ -766,8 +767,8 @@ def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0,
     if writer_backend == "acquire" and int(xy_levels) != 0:
         raise ValueError("acquire-zarr decimates all spatial axes; xy_levels must be 0")
 
-    # Keep Blosc from oversubscribing inside each process
-    # os.environ.setdefault("BLOSC_NTHREADS", "4")   # tune if needed
+    # acquire-zarr compresses with blosc_compress_ctx(nthreads=1), so
+    # BLOSC_NTHREADS is irrelevant there; the knob is num_threads below.
     pid = os.getpid()
     print(f"[PID {pid}] start processing {file_path}")
 
@@ -796,6 +797,9 @@ def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0,
         # = max_levels + 1, T1 ground truth), while plan_levels counts TOTAL
         # levels (s0..s{levels-1}): levels - 1 reproduces the python writer's
         # pyramid depth exactly.
+        # num_threads: C++ stream threads for this process. parallel_convert
+        # splits the visible CPUs across workers so N batch workers do not
+        # each grab every core; None (direct calls) keeps the writer default.
         write_volume_ome_zarr_acquire(
             image,
             out_path,
@@ -803,6 +807,7 @@ def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0,
             chunk_shape_zyx=(256, 256, 256),
             shard_shape_zyx=(tuple(int(s) for s in shard_shape) if shard_shape else None),
             num_levels=max(0, levels - 1),
+            num_threads=num_threads,
             overwrite=False,
         )
         print(f"[PID {pid}] done with {file_path}")
@@ -833,7 +838,8 @@ def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0,
     return str(out_path)
 
 def worker_loop(task_q, success_q,error_q, out_dir, voxel, xy_levels,
-                ome_version="0.5", shard_shape=None, writer_backend="acquire"):
+                ome_version="0.5", shard_shape=None, writer_backend="acquire",
+                num_threads=None):
     """Each process pulls tasks from the queue until it's empty."""
     while True:
         file_path = task_q.get()
@@ -843,7 +849,8 @@ def worker_loop(task_q, success_q,error_q, out_dir, voxel, xy_levels,
         try:
             res = convert_one(file_path, out_dir, voxel, xy_levels,
                               ome_version=ome_version, shard_shape=shard_shape,
-                              writer_backend=writer_backend)
+                              writer_backend=writer_backend,
+                              num_threads=num_threads)
             success_q.put(res)
         except Exception as e:
             error_q.put((file_path, f"error: {e}"))
@@ -851,23 +858,42 @@ def worker_loop(task_q, success_q,error_q, out_dir, voxel, xy_levels,
             task_q.task_done()
 
 
+def default_writer_threads(num_workers: int) -> int:
+    """Split the visible CPUs evenly across batch worker processes.
+
+    Keeps N concurrent acquire-zarr streams from each grabbing every core
+    (the C++ stream defaults to all visible CPUs per process).
+    """
+    if hasattr(os, "sched_getaffinity"):
+        total_cpus = len(os.sched_getaffinity(0))
+    else:
+        total_cpus = os.cpu_count() or 1
+    return max(1, total_cpus // max(1, int(num_workers)))
+
+
 def parallel_convert(files, out_dir, voxel=(1,1,1), xy_levels=0,
                      max_queue=10, num_workers=5, ome_version="0.5", shard_shape=None,
-                     writer_backend="acquire"):
+                     writer_backend="acquire", num_threads=None):
     """
     Run conversion on many files with bounded memory use.
 
     max_queue = how many files may be "in-flight" (decoded) at once.
+    num_threads = writer threads per worker process for the acquire backend.
+    None (default) splits the visible CPUs evenly across workers, so N
+    workers each get total//N C++ stream threads instead of every core.
     """
+    if num_threads is None:
+        num_threads = default_writer_threads(num_workers)
     task_q = mp.JoinableQueue(max_queue)
     success_q = mp.Queue()
     error_q = mp.Queue()
-    print(f"Starting conversion with {num_workers} workers...")
+    print(f"Starting conversion with {num_workers} workers "
+          f"({num_threads} writer threads each)...")
     # Start workers
     workers = [
         mp.Process(target=worker_loop,
                    args=(task_q, success_q, error_q, out_dir, voxel, xy_levels,
-                         ome_version, shard_shape, writer_backend))
+                         ome_version, shard_shape, writer_backend, num_threads))
         for _ in range(num_workers)
     ]
     for w in workers:
@@ -973,6 +999,13 @@ if __name__ == "__main__":
                              "the default chunking); smaller z values reduce peak RAM, "
                              "e.g. --shard_shape 256 256 256.")
 
+    parser.add_argument("--writer_threads", type=int, default=None,
+                        help="Writer threads per worker process for the acquire "
+                             "backend (0.5 path). Default: split the visible "
+                             "CPUs evenly across --num_workers, so batch workers "
+                             "do not each grab every core. Ignored by the python "
+                             "backend.")
+
     args = parser.parse_args()
     try:
         writer_backend = resolve_writer_backend(args.writer, args.ome_version)
@@ -1010,7 +1043,8 @@ if __name__ == "__main__":
                                    max_queue=10, num_workers=num_workers,
                                    ome_version=args.ome_version,
                                    shard_shape=args.shard_shape,
-                                   writer_backend=writer_backend)
+                                   writer_backend=writer_backend,
+                                   num_threads=args.writer_threads)
         print(f"Successfully converted {len(sucess)} out of {len(files_list)} files.")
         print(f"Errors encountered for {len(error)} files: {error}")
         end_time = time.time()
