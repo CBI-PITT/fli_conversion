@@ -745,12 +745,13 @@ def resolve_writer_backend(writer_arg, ome_version):
     """Map a CLI --writer value + ome_version to a backend (None: 0.5->acquire, 0.4->python)."""
     if writer_arg is None:
         return "acquire" if ome_version == "0.5" else "python"
-    if writer_arg not in ("acquire", "python"):
+    if writer_arg not in ("acquire", "python", "zarrista"):
         raise ValueError(
-            f"Unknown writer backend {writer_arg!r}; use 'acquire' or 'python'."
+            f"Unknown writer backend {writer_arg!r}; "
+            "use 'acquire', 'python' or 'zarrista'."
         )
-    if writer_arg == "acquire" and ome_version != "0.5":
-        raise ValueError("acquire-zarr backend requires ome_version 0.5")
+    if writer_arg in ("acquire", "zarrista") and ome_version != "0.5":
+        raise ValueError(f"{writer_arg} backend requires ome_version 0.5")
     return writer_arg
 
 
@@ -758,14 +759,16 @@ def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0,
                 ome_version="0.5", shard_shape=None, writer_backend="acquire",
                 num_threads=None):
     # Guards must fire before fli_loading: no file I/O on invalid input.
-    if writer_backend not in ("acquire", "python"):
+    if writer_backend not in ("acquire", "python", "zarrista"):
         raise ValueError(
-            f"Unknown writer backend {writer_backend!r}; use 'acquire' or 'python'."
+            f"Unknown writer backend {writer_backend!r}; "
+            "use 'acquire', 'python' or 'zarrista'."
         )
-    if ome_version == "0.4" and writer_backend == "acquire":
-        raise ValueError("acquire-zarr backend requires ome_version 0.5")
-    if writer_backend == "acquire" and int(xy_levels) != 0:
-        raise ValueError("acquire-zarr decimates all spatial axes; xy_levels must be 0")
+    if ome_version == "0.4" and writer_backend in ("acquire", "zarrista"):
+        raise ValueError(f"{writer_backend} backend requires ome_version 0.5")
+    if writer_backend in ("acquire", "zarrista") and int(xy_levels) != 0:
+        raise ValueError(
+            f"{writer_backend} decimates all spatial axes; xy_levels must be 0")
 
     # acquire-zarr compresses with blosc_compress_ctx(nthreads=1), so
     # BLOSC_NTHREADS is irrelevant there; the knob is num_threads below.
@@ -808,6 +811,29 @@ def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0,
             shard_shape_zyx=(tuple(int(s) for s in shard_shape) if shard_shape else None),
             num_levels=max(0, levels - 1),
             num_threads=num_threads,
+            overwrite=False,
+        )
+        print(f"[PID {pid}] done with {file_path}")
+        return str(out_path)
+
+    if writer_backend == "zarrista":
+        # Lazy import: the other backends must not require ngff-zarr.
+        from zarrista_writer import write_volume_ome_zarr_zarrista
+
+        # num_levels counts ADDITIONAL pyramid levels (like acquire's
+        # max_levels): levels - 1 additional halvings reproduce the python
+        # writer's pyramid depth. num_threads: Dask worker threads for this
+        # process (parallel_convert splits the visible CPUs across workers);
+        # the Rust pool size is set separately via RAYON_NUM_THREADS.
+        write_volume_ome_zarr_zarrista(
+            image,
+            out_path,
+            voxel_size_zyx_um=tuple(float(v) for v in voxel),
+            chunk_shape_zyx=(256, 256, 256),
+            shard_shape_zyx=(tuple(int(s) for s in shard_shape) if shard_shape else None),
+            num_levels=max(0, levels - 1),
+            num_workers=num_threads,
+            show_progress=False,
             overwrite=False,
         )
         print(f"[PID {pid}] done with {file_path}")
@@ -862,7 +888,9 @@ def default_writer_threads(num_workers: int) -> int:
     """Split the visible CPUs evenly across batch worker processes.
 
     Keeps N concurrent acquire-zarr streams from each grabbing every core
-    (the C++ stream defaults to all visible CPUs per process).
+    (the C++ stream defaults to all visible CPUs per process), and the same
+    for N concurrent zarrista writers (whose Dask workers and Rust pool
+    default to all visible CPUs per process).
     """
     if hasattr(os, "sched_getaffinity"):
         total_cpus = len(os.sched_getaffinity(0))
@@ -983,17 +1011,20 @@ if __name__ == "__main__":
                         help="Output OME-Zarr version. 0.5 (default): sharded zarr v3, "
                              "written as <stem>.ome.zarr (requires a zarr v3 environment), "
                              "written with the acquire-zarr C++ writer by default "
-                             "(--writer python for the previous writer). "
+                             "(--writer python for the previous writer, --writer zarrista "
+                             "for ngff-zarr/Rust zarrs). "
                              "0.4: legacy H5-backed zarr v2, written as <stem>.omehans "
                              "(requires a zarr v2 environment with zarr_stores).")
-    parser.add_argument("--writer", type=str, choices=["acquire", "python"], default=None,
+    parser.add_argument("--writer", type=str, choices=["acquire", "python", "zarrista"], default=None,
                         help="Writer backend for ome_version 0.5. Default: acquire "
                              "(acquire-zarr C++). 'python' uses the Live3DPyramidWriter. "
+                             "'zarrista' uses ngff-zarr 0.52 with the Rust zarrs transport "
+                             "(requires ngff-zarr, dask, numcodecs). "
                              "ome_version 0.4 always uses python.")
     parser.add_argument("--shard_shape", type=int, nargs=3, default=None,
                         metavar=('Z', 'Y', 'X'),
                         help="Shard shape (z,y,x) for the 0.5 sharded output, honored by "
-                             "both writer backends (acquire is the default for 0.5). "
+                             "all writer backends (acquire is the default for 0.5). "
                              "Default: 4x the chunk along z, chunk-sized along y/x. Each "
                              "value must be a multiple of that axis' chunk size (256 with "
                              "the default chunking); smaller z values reduce peak RAM, "
@@ -1001,10 +1032,12 @@ if __name__ == "__main__":
 
     parser.add_argument("--writer_threads", type=int, default=None,
                         help="Writer threads per worker process for the acquire "
-                             "backend (0.5 path). Default: split the visible "
-                             "CPUs evenly across --num_workers, so batch workers "
+                             "backend (C++ stream threads) and Dask worker threads "
+                             "for the zarrista backend (0.5 path). Default: split the "
+                             "visible CPUs evenly across --num_workers, so batch workers "
                              "do not each grab every core. Ignored by the python "
-                             "backend.")
+                             "backend. For zarrista, the Rust pool size is set "
+                             "separately via RAYON_NUM_THREADS.")
 
     args = parser.parse_args()
     try:
