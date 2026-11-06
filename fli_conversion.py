@@ -123,7 +123,12 @@ def infer_n_levels(y, x, z_estimate, min_dim=256):
 
 def compute_xy_only_levels(voxel_size):
     """Return how many leading pyramid levels should be XY-only (no Z decimation),
-    so that XY spacing never exceeds Z spacing."""
+    so that XY spacing never exceeds Z spacing.
+
+    Note: with true (z, y, x) light-sheet voxels the z step is the SMALLEST
+    value, so this returns 0; the CLI hardcodes xy_levels=0 and the acquire
+    backend requires 0 anyway.
+    """
     dz, dy, dx = map(float, voxel_size)
     # how many 2x steps can XY take without exceeding dz?
     ky = 0 if dy <= 0 else max(0, math.floor(math.log2(dz / dy)))
@@ -903,7 +908,9 @@ if __name__ == "__main__":
 
     parser.add_argument("--voxel", type=float, nargs=3, required=True,
                         metavar=('Z', 'Y', 'X'),
-                        help="Voxel size in microns, e.g. --voxel 2 1.17 1.04")
+                        help="Voxel size (Z Y X) in microns: z step between planes first, "
+                             "then y and x pixel size, e.g. --voxel 0.528 0.5616 2.0 for "
+                             "z=0.528, y=0.5616, x=2.0 (x is the stage-scan axis)")
     parser.add_argument("--output", type=str, required=True,
                         help="Output directory or file path.")
     parser.add_argument("--num_workers", type=int, default=1,

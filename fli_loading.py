@@ -298,9 +298,13 @@ def fli_loading(
     Z = get_number_of_frames(hicam_file, header_info=header_dict)
     Y, X = get_frame_shape(hicam_file, header_info=header_dict)
 
-    print(f'File dimensions: Z={Z}, Y={Y}, X={X}')
+    # FLI header names the camera sensor axes, not the sample axes: header "y"
+    # (Y here, 1024 px) is the microscope z (depth), header "x" (X here, 1280 px)
+    # is the microscope y; the frame count Z is the stage scan along the
+    # microscope x (long stripes along x, camera moved along the tissue).
+    print(f'File dimensions: {Z} frames (microscope x scan), {Y} px microscope z, {X} px microscope y')
 
-    # ---- Build Dask source A (z,y,x) from full IO groups only ----
+    # ---- Build Dask source A, true (z, y, x) = (microscope z, y, x scan) ----
     locs = []
     for loc in get_start_stop_reads_for_frame_groups(
         hicam_file, header_info=None, frames_at_once=frames_at_once
@@ -340,14 +344,18 @@ def fli_loading(
         #     out[i] = canvas.reshape((Y, X))
         arr12 = read_uint12(raw, coerce_to_uint16_values=True)
 
-        # 2) Reshape directly to (n0, Y, X)
-        out = arr12.reshape(n0, Y, X)
+        # 2) Reshape to (n0, Y, X) then transpose to true (z, y, x): frames are
+        #    the microscope x scan, Y (header y) is microscope z, X (header x) is
+        #    microscope y -> (microscope z, microscope y, microscope x scan).
+        #    Returns a VIEW (no copy); concatenate copies it into place, so peak
+        #    RAM stays at one frame group above the output array.
+        out = arr12.reshape(n0, Y, X).transpose(1, 2, 0)
         data_read_end = time.time()
         print(f'Data read and decode/convert_uint16/reshape for group {loc["group"]} took {data_read_end - data_read_start:.2f} seconds.')
         return out
 
     delayed_blocks = [delayed(_read_group)(loc) for loc in locs]
-    blocks = [da.from_delayed(db, shape=(frames_at_once, Y, X), dtype=np.uint16) for db in delayed_blocks]
-    A = da.concatenate(blocks, axis=0)  # (use_frames, Y, X)
+    blocks = [da.from_delayed(db, shape=(Y, X, frames_at_once), dtype=np.uint16) for db in delayed_blocks]
+    A = da.concatenate(blocks, axis=2)  # (microscope z, microscope y, microscope x scan)
     # A.compute()
     return A
