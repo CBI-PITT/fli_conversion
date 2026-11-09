@@ -200,6 +200,52 @@ def test_version_flag_default_is_0_5():
     assert inspect.signature(parallel_convert).parameters["ome_version"].default == "0.5"
 
 
+def test_fli_scan_axis_view_roundtrip():
+    """Packed FLI frames reach the writer as a strided (z, y, x) view."""
+    from fli_conversion import convert_one
+    from fli_loading import fli_loading
+
+    # Four scan-x frames, two microscope-z rows, four microscope-y columns.
+    # The fifth frame is the trailing frame excluded by the FLI loader.
+    frames = np.arange(5 * 2 * 4, dtype=np.uint16).reshape(5, 2, 4)
+    pairs = frames.reshape(-1, 2)
+    packed = np.column_stack((
+        pairs[:, 0] & 0xff,
+        ((pairs[:, 0] >> 8) & 0x0f) | ((pairs[:, 1] & 0x0f) << 4),
+        pairs[:, 1] >> 4,
+    )).astype(np.uint8).tobytes()
+    source = TMP / "orientation.fli"
+    source.write_bytes(b"x = 4\ny = 2\ntimestamps = 4\n{END}" + packed)
+
+    # This read has one full and one short group; their declared Dask shapes
+    # must reflect the actual frame counts.
+    raw = fli_loading(str(source), frames_at_once=3).compute()
+    assert raw.shape == (4, 2, 4)
+    np.testing.assert_array_equal(raw, frames[:4] * 16)
+
+    strides = []
+    original_push = Live3DPyramidWriter.push_slice
+
+    def capture_push(self, plane):
+        strides.append(plane.strides)
+        assert not plane.flags.c_contiguous
+        return original_push(self, plane)
+
+    Live3DPyramidWriter.push_slice = capture_push
+    try:
+        path = Path(convert_one(str(source), str(TMP), voxel=(0.528, 0.5616, 2.0)))
+    finally:
+        Live3DPyramidWriter.push_slice = original_push
+
+    assert len(strides) == 2
+    root = zarr.open(str(path), mode="r")
+    np.testing.assert_array_equal(root["s0"][0, 0], frames[:4].transpose(1, 2, 0) * 16)
+    ms = load_json(path / "zarr.json")["attributes"]["ome"]["multiscales"][0]
+    assert [axis["name"] for axis in ms["axes"]] == ["t", "c", "z", "y", "x"]
+    assert ms["datasets"][0]["coordinateTransformations"][0]["scale"] == [
+        1.0, 1.0, 0.528, 0.5616, 2.0]
+
+
 def main():
     if int(zarr.__version__.split(".")[0]) < 3:
         print(f"SKIP: requires zarr v3 (found {zarr.__version__})")
@@ -211,6 +257,7 @@ def main():
         check("writer_roundtrip", test_writer_roundtrip)
         check("overwrite_idempotency", test_overwrite_idempotency)
         check("version_flag_default_is_0_5", test_version_flag_default_is_0_5)
+        check("fli_scan_axis_view_roundtrip", test_fli_scan_axis_view_roundtrip)
     finally:
         shutil.rmtree(TMP, ignore_errors=True)
     print(f"\n{_passed} tests passed")

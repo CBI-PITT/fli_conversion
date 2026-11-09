@@ -753,8 +753,19 @@ def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0,
     pid = os.getpid()
     print(f"[PID {pid}] start processing {file_path}")
 
-    # --- load (you already know this works) ---
-    image = fli_loading(file_path, frames_at_once=3000).compute()
+    load_start = time.perf_counter()
+    raw_image = fli_loading(file_path, frames_at_once=3000).compute()
+    print(f"[PID {pid}] load: {time.perf_counter() - load_start:.1f} s; "
+          f"raw shape: {raw_image.shape}", flush=True)
+
+    # FLI frames scan microscope x; sensor y is microscope z and sensor x is
+    # microscope y. The writer accepts strided slices and copies each into its
+    # own buffer, so keep a view instead of copying the full volume again.
+    transpose_start = time.perf_counter()
+    image = raw_image.transpose(1, 2, 0)
+    del raw_image  # image retains the underlying array
+    print(f"[PID {pid}] view transpose: {time.perf_counter() - transpose_start:.1f} s; "
+          f"(z, y, x) shape: {image.shape}; strides: {image.strides}", flush=True)
     Z_EST, Y, X = image.shape
 
     levels = plan_levels(Y, X, Z_EST, xy_levels, min_dim=64)
@@ -770,6 +781,7 @@ def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0,
     ext = ".ome.zarr" if ome_version == "0.5" else ".omehans"
     out_path = out_dir / (Path(file_path).stem + ext)
 
+    write_start = time.perf_counter()
     # Writer: keep internal workers modest (we’re already in a process)
     n_workers = max(1, os.cpu_count() // 4)
     with Live3DPyramidWriter(
@@ -791,6 +803,7 @@ def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0,
         # Stream frames into the writer
         for k in range(Z_EST):
             writer.push_slice(image[k])
+    print(f"[PID {pid}] write: {time.perf_counter() - write_start:.1f} s", flush=True)
     print(f"[PID {pid}] done with {file_path}")
     return str(out_path)
 
@@ -967,7 +980,6 @@ if __name__ == "__main__":
         print(f"Total time for batch conversion: {end_time - start_time} seconds")
     else:
         print("No files to convert. Please specify a valid directory or file.")
-
 
 
 
