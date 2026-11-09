@@ -22,9 +22,13 @@ from fli_conversion import (  # noqa: E402
     FlushPad,
     Live3DPyramidWriter,
     PyramidSpec,
+    convert_one,
     ds2_mean_uint16,
     dsZ2_mean_uint16,
     init_sharded_zarr_v3,
+    level_factors,
+    plan_levels,
+    plan_x_only_levels,
 )
 
 TMP = Path(tempfile.mkdtemp(prefix="fli_zarr3_test_"))
@@ -58,6 +62,18 @@ def expected_level1(inp):
         last = ds2_mean_uint16(inp[2 * l])
         out.append(dsZ2_mean_uint16(last, last))
     return np.stack(out)
+
+
+def expected_x_only(inp):
+    """Independent X-pair mean reference, preserving every Z/Y position."""
+    z, y, x = inp.shape
+    out = np.empty((z, y, (x + 1) // 2), dtype=np.uint16)
+    for j in range(x // 2):
+        out[:, :, j] = ((inp[:, :, 2 * j].astype(np.uint32)
+                         + inp[:, :, 2 * j + 1].astype(np.uint32) + 1) // 2)
+    if x & 1:
+        out[:, :, -1] = out[:, :, -2] if x > 1 else inp[:, :, 0]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +216,77 @@ def test_version_flag_default_is_0_5():
     assert inspect.signature(parallel_convert).parameters["ome_version"].default == "0.5"
 
 
+def test_x_only_level_plan():
+    """Keep existing 3D levels, then stop at the first X size <= chunk target."""
+    base = plan_levels(1280, 42000, 1024, 0, min_dim=64)
+    assert base == 5
+    assert plan_x_only_levels(42000, base, 256) == 9
+    assert [level_factors(l, 0, base) for l in (4, 5, 8)] == [
+        (16, 16, 16), (16, 16, 32), (16, 16, 256)]
+    assert plan_x_only_levels(256, 1, 256) == 1
+    assert plan_x_only_levels(257, 1, 256) == 2
+
+
+def test_x_only_writer_roundtrip():
+    """After the 3D level, X shrinks but Z/Y pixels and scale stay fixed."""
+    path = TMP / "x_only.ome.zarr"
+    image = rng.integers(0, 4096, size=(5, 9, 19), dtype=np.uint16)
+    spec = PyramidSpec(z_size_estimate=5, y=9, x=19, levels=4, x_only_start=2)
+    scheme = ChunkScheme(base=(2, 4, 4), target=(2, 4, 4))
+    with Live3DPyramidWriter(spec, voxel_size=(0.528, 0.5616, 2.0), path=str(path),
+                             chunk_scheme=scheme, ome_version="0.5",
+                             async_close=False, xy_levels=0) as writer:
+        for plane in image:
+            writer.push_slice(plane)
+
+    root = zarr.open(str(path), mode="r")
+    l1 = expected_level1(image)
+    l2 = expected_x_only(l1)
+    l3 = expected_x_only(l2)
+    for level, expected in enumerate((image, l1, l2, l3)):
+        actual = np.asarray(root[f"s{level}"][:])[0, 0]
+        assert actual.shape == expected.shape, (level, actual.shape, expected.shape)
+        np.testing.assert_array_equal(actual, expected)
+    assert [l1.shape, l2.shape, l3.shape] == [(3, 5, 10), (3, 5, 5), (3, 5, 3)]
+
+    ms = load_json(path / "zarr.json")["attributes"]["ome"]["multiscales"][0]
+    assert [d["coordinateTransformations"][0]["scale"] for d in ms["datasets"]] == [
+        [1.0, 1.0, 0.528, 0.5616, 2.0],
+        [1.0, 1.0, 1.056, 1.1232, 4.0],
+        [1.0, 1.0, 1.056, 1.1232, 8.0],
+        [1.0, 1.0, 1.056, 1.1232, 16.0],
+    ]
+
+
+def test_convert_one_x_only_tail():
+    """The FLI entry point enables X-only levels and stops once X fits a chunk."""
+    frames = (np.arange(601 * 2 * 4, dtype=np.uint16) % 200).reshape(601, 2, 4)
+    pairs = frames.reshape(-1, 2)
+    packed = np.column_stack((
+        pairs[:, 0] & 0xff,
+        ((pairs[:, 0] >> 8) & 0x0f) | ((pairs[:, 1] & 0x0f) << 4),
+        pairs[:, 1] >> 4,
+    )).astype(np.uint8).tobytes()
+    source = TMP / "x_only.fli"
+    source.write_bytes(b"x = 4\ny = 2\ntimestamps = 600\n{END}" + packed)
+
+    path = convert_one(str(source), str(TMP), voxel=(0.528, 0.5616, 2.0))
+    root = zarr.open(path, mode="r")
+    l0 = frames[:600].transpose(1, 2, 0) * 16
+    l1 = expected_x_only(l0)
+    l2 = expected_x_only(l1)
+    for level, expected in enumerate((l0, l1, l2)):
+        actual = np.asarray(root[f"s{level}"][:])[0, 0]
+        np.testing.assert_array_equal(actual, expected)
+    assert l2.shape == (2, 4, 150)
+    ms = load_json(Path(path) / "zarr.json")["attributes"]["ome"]["multiscales"][0]
+    assert [d["coordinateTransformations"][0]["scale"] for d in ms["datasets"]] == [
+        [1.0, 1.0, 0.528, 0.5616, 2.0],
+        [1.0, 1.0, 0.528, 0.5616, 4.0],
+        [1.0, 1.0, 0.528, 0.5616, 8.0],
+    ]
+
+
 def test_fli_scan_axis_view_roundtrip():
     """Packed FLI frames reach the writer as a strided (z, y, x) view."""
     from fli_conversion import convert_one
@@ -257,6 +344,9 @@ def main():
         check("writer_roundtrip", test_writer_roundtrip)
         check("overwrite_idempotency", test_overwrite_idempotency)
         check("version_flag_default_is_0_5", test_version_flag_default_is_0_5)
+        check("x_only_level_plan", test_x_only_level_plan)
+        check("x_only_writer_roundtrip", test_x_only_writer_roundtrip)
+        check("convert_one_x_only_tail", test_convert_one_x_only_tail)
         check("fli_scan_axis_view_roundtrip", test_fli_scan_axis_view_roundtrip)
     finally:
         shutil.rmtree(TMP, ignore_errors=True)

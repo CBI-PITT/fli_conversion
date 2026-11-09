@@ -113,6 +113,21 @@ def dsZ2_mean_uint16(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Mean of two uint16 slices -> uint16."""
     return ((a.astype(np.uint32) + b.astype(np.uint32) + 1) >> 1).astype(np.uint16)
 
+
+def dsX2_mean_uint16(img: np.ndarray) -> np.ndarray:
+    """Halve X without changing Y, using the same odd-edge policy as ds2_mean_uint16."""
+    x = img.shape[1]
+    if x == 1:
+        return img.copy()
+    x2 = x - (x & 1)
+    a = img[:, :x2:2].astype(np.uint32)
+    b = img[:, 1:x2:2].astype(np.uint32)
+    out = ((a + b + 1) >> 1).astype(np.uint16)
+    if x & 1:
+        out = np.hstack([out, out[:, -1:]])
+    return out
+
+
 def infer_n_levels(y, x, z_estimate, min_dim=256):
     """Stop when any axis would shrink below min_dim (spatial) or z_estimate//2**L < 1."""
     levels = 1
@@ -126,8 +141,7 @@ def compute_xy_only_levels(voxel_size):
     so that XY spacing never exceeds Z spacing.
 
     Note: with true (z, y, x) light-sheet voxels the z step is the SMALLEST
-    value, so this returns 0; the CLI hardcodes xy_levels=0 and the acquire
-    backend requires 0 anyway.
+    value, so this returns 0; the CLI explicitly passes xy_levels=0.
     """
     dz, dy, dx = map(float, voxel_size)
     # how many 2x steps can XY take without exceeding dz?
@@ -135,13 +149,14 @@ def compute_xy_only_levels(voxel_size):
     kx = 0 if dx <= 0 else max(0, math.floor(math.log2(dz / dx)))
     return int(max(0, min(ky, kx)))  # lockstep XY downsampling
 
-def level_factors(level: int, xy_levels: int):
-    """Per-level physical scaling factors relative to level 0 for (z,y,x)."""
-    if level <= xy_levels:
+def level_factors(level: int, xy_levels: int, x_only_start: int | None = None):
+    """Per-level (z,y,x) factors; freeze Z/Y at the first X-only level."""
+    zy_level = min(level, x_only_start - 1) if x_only_start is not None else level
+    if zy_level <= xy_levels:
         zf = 1
     else:
-        zf = 2 ** (level - xy_levels)
-    yf = 2 ** level
+        zf = 2 ** (zy_level - xy_levels)
+    yf = 2 ** zy_level
     xf = 2 ** level
     return zf, yf, xf
 
@@ -160,6 +175,16 @@ def plan_levels(y, x, z_estimate, xy_levels, min_dim=256):
     return L
 
 
+def plan_x_only_levels(x, base_levels, x_chunk):
+    """Extend the existing pyramid until X first fits in one target X chunk."""
+    if base_levels < 1 or x_chunk < 1:
+        raise ValueError("base_levels and x_chunk must be positive")
+    levels = base_levels
+    while ceil_div(x, 2 ** (levels - 1)) > x_chunk:
+        levels += 1
+    return levels
+
+
 @dataclass
 class ChunkSpec:
     z: int = 8
@@ -172,6 +197,7 @@ class PyramidSpec:
     y: int
     x: int
     levels: int
+    x_only_start: int | None = None  # first X-only level; None keeps the 3D cascade
 
 
 
@@ -232,7 +258,7 @@ def init_h5_nested_store_v2(
     root = zarr.open_group(store=store, mode="w")
     arrs = []
     for l in range(spec.levels):
-        zf, yf, xf = level_factors(l, xy_levels)
+        zf, yf, xf = level_factors(l, xy_levels, spec.x_only_start)
         z_l = ceil_div(spec.z_size_estimate, zf)
         y_l = ceil_div(spec.y, yf)
         x_l = ceil_div(spec.x, xf)
@@ -261,7 +287,7 @@ def init_h5_nested_store_v2(
     dz, dy, dx = voxel_size
     datasets = []
     for l in range(spec.levels):
-        zf, yf, xf = level_factors(l, xy_levels)
+        zf, yf, xf = level_factors(l, xy_levels, spec.x_only_start)
         s = [1.0, 1.0, dz * zf, dy * yf, dx * xf]
         datasets.append({
             "path": f"s{l}",
@@ -315,7 +341,7 @@ def init_sharded_zarr_v3(
     # so an invalid shard shape does not leave a partial store behind.
     level_plans = []
     for l in range(spec.levels):
-        zf, yf, xf = level_factors(l, xy_levels)
+        zf, yf, xf = level_factors(l, xy_levels, spec.x_only_start)
         z_l = ceil_div(spec.z_size_estimate, zf)
         y_l = ceil_div(spec.y, yf)
         x_l = ceil_div(spec.x, xf)
@@ -363,7 +389,7 @@ def init_sharded_zarr_v3(
     dz, dy, dx = voxel_size
     datasets = []
     for l in range(spec.levels):
-        zf, yf, xf = level_factors(l, xy_levels)
+        zf, yf, xf = level_factors(l, xy_levels, spec.x_only_start)
         s = [1.0, 1.0, dz * zf, dy * yf, dx * xf]
         datasets.append({
             "path": f"s{l}",
@@ -399,7 +425,7 @@ class FlushPad(Enum):
 # ---------- Live writer: true 3D decimation pipeline ----------
 class Live3DPyramidWriter:
     """
-    Streams true-3D (2x in z,y,x) pyramid while you acquire slices.
+    Streams a 3D pyramid with an optional X-only tail while you acquire slices.
     Buffers complete Z-chunks per level and flushes only when full -> no read-modify-write.
     """
 
@@ -423,6 +449,10 @@ class Live3DPyramidWriter:
         self.flush_pad = flush_pad
         self.xy_levels =(compute_xy_only_levels(voxel_size)if xy_levels is None
                         else int(xy_levels))
+        if spec.x_only_start is not None and not (
+            self.xy_levels < spec.x_only_start <= spec.levels
+        ):
+            raise ValueError("x_only_start must follow the XY-only levels and not exceed levels")
         self.max_workers = max_workers or min(8, os.cpu_count() or 4)
         self.async_close = async_close
         self.finalize_future = None
@@ -449,7 +479,7 @@ class Live3DPyramidWriter:
         self.yx_shapes = []
 
         for l in range(self.levels):
-            zf, yf, xf = level_factors(l, self.xy_levels)
+            zf, yf, xf = level_factors(l, self.xy_levels, self.spec.x_only_start)
             z_l = ceil_div(self.spec.z_size_estimate, zf)
             y_l = ceil_div(self.spec.y, yf)
             x_l = ceil_div(self.spec.x, xf)
@@ -571,10 +601,12 @@ class Live3DPyramidWriter:
     def _flush_pair_tails_all_the_way(self):
         if not hasattr(self, "_pair_buf"):
             return
+        # X-only levels preserve Z and never have an outstanding Z pair.
+        pair_end = self.spec.x_only_start if self.spec.x_only_start is not None else self.levels
         changed = True
         while changed:
             changed = False
-            for lvl in range(max(1, self.xy_levels + 1), self.levels):  # start at first 3D level
+            for lvl in range(max(1, self.xy_levels + 1), pair_end):
                 buf = self._pair_buf[lvl]
                 if buf is None:
                     continue
@@ -588,7 +620,8 @@ class Live3DPyramidWriter:
                 self._pair_buf[lvl] = None
                 zL = self._reserve_z(lvl)
                 self._append_to_active_buffer(lvl, zL, tail)
-                self._emit_next(lvl + 1, ds2_mean_uint16(tail))
+                if lvl + 1 < self.levels:
+                    self._emit_next(lvl + 1, self._downsample_for_next(tail, lvl + 1))
                 changed = True
 
     def _consume(self):
@@ -703,28 +736,42 @@ class Live3DPyramidWriter:
         self.buf_fill[level] = 0
         # do not change self.buf_start[level]
 
+    def _downsample_for_next(self, plane: np.ndarray, next_level: int) -> np.ndarray:
+        if self.spec.x_only_start is not None and next_level >= self.spec.x_only_start:
+            return dsX2_mean_uint16(plane)
+        return ds2_mean_uint16(plane)
+
     def _ingest_raw(self, img0: np.ndarray):
         with self.lock:
             # Level 0: write into active chunk
             z0 = self._reserve_z(0)
             self._append_to_active_buffer(0, z0, img0)
 
-            # Build and cascade upper levels (true 3D, factor 2^L)
+            # Build and cascade upper levels with the appropriate spatial factors.
             if self.levels > 1:
-                self._emit_next(level=1, candidate_xy=ds2_mean_uint16(img0))
+                self._emit_next(level=1, candidate=self._downsample_for_next(img0, 1))
 
 
 
-    def _emit_next(self, level: int, candidate_xy: np.ndarray):
+    def _emit_next(self, level: int, candidate: np.ndarray):
         if level >= self.levels:
+            return
+
+        if self.spec.x_only_start is not None and level >= self.spec.x_only_start:
+            # Each incoming plane keeps its Z index; Y was not downsampled.
+            zL = self._reserve_z(level)
+            self._append_to_active_buffer(level, zL, candidate)
+            if level + 1 < self.levels:
+                self._emit_next(level + 1, self._downsample_for_next(candidate, level + 1))
             return
 
         if level <= self.xy_levels:
             # XY-only stage: append every incoming slice (no Z pairing)
             zL = self._reserve_z(level)
-            self._append_to_active_buffer(level, zL, candidate_xy)
+            self._append_to_active_buffer(level, zL, candidate)
             # continue XY decimation upward
-            self._emit_next(level + 1, ds2_mean_uint16(candidate_xy))
+            if level + 1 < self.levels:
+                self._emit_next(level + 1, self._downsample_for_next(candidate, level + 1))
             return
 
         # 3D stage: pair consecutive planes along Z
@@ -733,17 +780,18 @@ class Live3DPyramidWriter:
 
         buf = self._pair_buf[level]
         if buf is None:
-            self._pair_buf[level] = candidate_xy
+            self._pair_buf[level] = candidate
             return
 
-        out_3d = dsZ2_mean_uint16(buf, candidate_xy)
+        out_3d = dsZ2_mean_uint16(buf, candidate)
         self._pair_buf[level] = None
 
         zL = self._reserve_z(level)
         self._append_to_active_buffer(level, zL, out_3d)
 
-        # propagate upward with further XY decimation
-        self._emit_next(level + 1, ds2_mean_uint16(out_3d))
+        # Propagate with XY decimation for 3D levels, or X-only for the tail.
+        if level + 1 < self.levels:
+            self._emit_next(level + 1, self._downsample_for_next(out_3d, level + 1))
 
 
 def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0,
@@ -768,11 +816,13 @@ def convert_one(file_path: str, out_dir: str, voxel=(1, 1, 1), xy_levels=0,
           f"(z, y, x) shape: {image.shape}; strides: {image.strides}", flush=True)
     Z_EST, Y, X = image.shape
 
-    levels = plan_levels(Y, X, Z_EST, xy_levels, min_dim=64)
-    spec = PyramidSpec(z_size_estimate=Z_EST, y=Y, x=X, levels=levels)
-
-    # Friendlier L0 Z-chunk (36000 % 32 == 0). Keeps L0 chunk-aligned.
+    # Preserve the existing 3D levels, then halve only X until it fits the
+    # target X chunk (256 voxels with this scheme).
     scheme = ChunkScheme(base=(256, 256, 256), target=(256, 256, 256))
+    base_levels = plan_levels(Y, X, Z_EST, xy_levels, min_dim=64)
+    levels = plan_x_only_levels(X, base_levels, scheme.target[2])
+    spec = PyramidSpec(z_size_estimate=Z_EST, y=Y, x=X, levels=levels,
+                       x_only_start=base_levels if levels > base_levels else None)
 
     # Build output path
     out_dir = Path(out_dir)
@@ -980,12 +1030,6 @@ if __name__ == "__main__":
         print(f"Total time for batch conversion: {end_time - start_time} seconds")
     else:
         print("No files to convert. Please specify a valid directory or file.")
-
-
-
-
-
-
 
 
 
